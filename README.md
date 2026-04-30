@@ -83,6 +83,3 @@ Each script contains explicit example commands and writes Hydra outputs under `o
 
 This repository builds on and adapts ideas, interfaces, and evaluation utilities from several open research projects. We gratefully acknowledge the authors and maintainers of [d2Cache](https://github.com/Kamichanw/d2Cache), [Fast-dLLM v2](https://research.nvidia.com/labs/eai/publication/fast-dllm-v2/), [EAGLE-3](https://github.com/SafeAILab/EAGLE), and the [Language Model Evaluation Harness](https://github.com/EleutherAI/lm-evaluation-harness). Their released methods and infrastructure provide important foundations for reproducible studies of efficient LLM inference.
 
-## Citation
-
-Coming soon.
