@@ -7,6 +7,8 @@ This repository organizes the experiments in the survey around two questions:
 1. How do different inference-acceleration techniques behave on diffusion language models (DLLMs)?
 2. How do optimized or integrated DLLM systems compare with autoregressive LLM (AR-LLM) baselines?
 
+https://github.com/user-attachments/assets/0cfcbbc9-531e-4cf4-8eb9-2dd32aa2447b
+
 ## Installation
 
 ```bash
