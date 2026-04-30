@@ -1,0 +1,2 @@
+from .modeling_fast_dllm_v2 import Fast_dLLM_QwenForCausalLM
+from .configuration_fast_dllm_v2 import Fast_dLLM_QwenConfig

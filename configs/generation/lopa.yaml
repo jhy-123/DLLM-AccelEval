@@ -1,0 +1,7 @@
+defaults:
+  - vanilla
+  - _self_
+
+strategy: "lopa"
+k: 5
+threshold: 0.9

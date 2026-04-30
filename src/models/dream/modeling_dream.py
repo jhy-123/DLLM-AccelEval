@@ -1,0 +1,1152 @@
+# coding=utf-8
+# Copyright 2024 The Dream team, HKUNLP Group and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT and Qwen implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT and Qwen used by the Meta AI and Qwen team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch Dream model."""
+
+import math
+from typing import List, Optional, Tuple, Union
+import os
+import torch
+import torch.utils.checkpoint
+from torch import nn
+
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_outputs import (
+    BaseModelOutput,
+    MaskedLMOutput,
+)
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import logging
+from transformers.configuration_utils import PretrainedConfig
+
+from src.cache import dCache
+from ..sparsed_utils import (
+    create_attention_block_mask,
+    create_block_mask_cached,
+    customize_mask,
+    flex_attention,
+    flex_attention_available,
+)
+from .configuration_dream import DreamConfig
+from .generation_utils import DreamGenerationMixin, DreamGenerationConfig
+
+
+logger = logging.get_logger(__name__)
+_LOGGED_WARNING_MESSAGES: set[str] = set()
+
+
+def _log_warning_once(message: str) -> None:
+    if message not in _LOGGED_WARNING_MESSAGES:
+        logger.warning(message)
+        _LOGGED_WARNING_MESSAGES.add(message)
+
+
+_CHECKPOINT_FOR_DOC = "Dream-7B"
+_CONFIG_FOR_DOC = "DreamConfig"
+
+
+# Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Dream
+class DreamRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        DreamRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+# Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Dream
+class DreamRotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim=None,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        scaling_factor=1.0,
+        rope_type="default",
+        config: Optional[DreamConfig] = None,
+    ):
+        super().__init__()
+        # TODO (joao): remove the `if` below, only used for BC
+        self.rope_kwargs = {}
+        if config is None:
+            logger.warning_once(
+                "`DreamRotaryEmbedding` can now be fully parameterized by passing the model config through the "
+                "`config` argument. All other arguments will be removed in v4.46"
+            )
+            self.rope_kwargs = {
+                "rope_type": rope_type,
+                "factor": scaling_factor,
+                "dim": dim,
+                "base": base,
+                "max_position_embeddings": max_position_embeddings,
+            }
+            self.rope_type = rope_type
+            self.max_seq_len_cached = max_position_embeddings
+            self.original_max_seq_len = max_position_embeddings
+        else:
+            # BC: "rope_type" was originally "type"
+            if config.rope_scaling is not None:
+                self.rope_type = config.rope_scaling.get(
+                    "rope_type", config.rope_scaling.get("type")
+                )
+            else:
+                self.rope_type = "default"
+            self.max_seq_len_cached = config.max_position_embeddings
+            self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(
+            self.config, device, **self.rope_kwargs
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def reset_parameters(self):
+        inv_freq, self.attention_scaling = self.rope_init_fn(
+            self.config, self.inv_freq.device, **self.rope_kwargs
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, device, seq_len=seq_len, **self.rope_kwargs
+            )
+            self.register_buffer(
+                "inv_freq", inv_freq, persistent=False
+            )  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if (
+            seq_len < self.original_max_seq_len
+            and self.max_seq_len_cached > self.original_max_seq_len
+        ):  # reset
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # Core RoPE block
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = (
+            device_type
+            if isinstance(device_type, str) and device_type != "mps"
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+# Copied from transformers.models.llama.modeling_llama.rotate_half
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+# Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Dream
+class DreamMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_state):
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state)
+        )
+
+
+# Copied from transformers.models.llama.modeling_llama.repeat_kv
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+class DreamAttention(nn.Module):
+    """
+    Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
+    and "Generating Long Sequences with Sparse Transformers".
+    """
+
+    def __init__(self, config: DreamConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
+                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = False
+        self.attention_dropout = config.attention_dropout
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=True
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=False
+        )
+
+        self.rotary_emb = DreamRotaryEmbedding(config=self.config)
+        self.flash_attn_func = None
+        self._logged_attention_backend = False
+        self.fine_mask = None
+        self.last = None
+        self.block_mask = None
+        if getattr(config, "flash_attention", False):
+            try:
+                from flash_attn import flash_attn_func  # type: ignore
+
+                self.flash_attn_func = flash_attn_func
+            except ModuleNotFoundError:
+                logger.warning_once("flash_attention=True but flash_attn is not installed; falling back to SDPA.")
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_norm: nn.Module,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[dCache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # will become mandatory in v4.46
+        SparseD_param: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        bsz, _, _ = hidden_states.size()
+        # create a dummy cache to simplify code
+        past_key_values = past_key_values or dCache(self.config)
+
+        with past_key_values.attention(
+            self.layer_idx,
+            hidden_states,
+            attn_norm,
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        ) as ctx:
+            q_mismatch = ctx.q.shape != hidden_states.shape and (
+                ctx.q_position_ids is None
+                or ctx.q_position_ids.shape != ctx.q.shape[:2]
+            )
+            kv_mismatch = (
+                ctx.k.shape != hidden_states.shape or ctx.v.shape != hidden_states.shape
+            ) and (
+                ctx.kv_position_ids is None
+                or ctx.kv_position_ids.shape != ctx.k.shape[:2]
+            )
+            if q_mismatch or kv_mismatch:
+                raise ValueError(
+                    "If you select a subset of the qkv in past_key_values, "
+                    "the q, k, v must match the shape of corresponding position_ids."
+                )
+
+            q = ctx.q.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            k = ctx.k.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
+            v = ctx.v.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
+
+            cos, sin = self.rotary_emb(v, ctx.kv_position_ids)
+            k = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
+            cos, sin = self.rotary_emb(q, ctx.q_position_ids)
+            q = (q * cos.unsqueeze(1)) + (rotate_half(q) * sin.unsqueeze(1))
+
+            # repeat k/v heads if n_kv_heads < n_heads
+            k = repeat_kv(k, self.num_key_value_groups)
+            v = repeat_kv(v, self.num_key_value_groups)
+
+            sparse_cfg = None
+            if SparseD_param is not None:
+                sparse_cfg = {
+                    "now_step": int(SparseD_param.get("now_step", 0)),
+                    "whole_steps": int(SparseD_param.get("whole_steps", 1)),
+                    "new_generation": int(SparseD_param.get("new_generation", q.size(2))),
+                    "skip": float(SparseD_param.get("skip", 0.0)),
+                    "select": float(SparseD_param.get("select", 1.0)),
+                    "block_size": max(1, int(SparseD_param.get("block_size", 128))),
+                }
+                if sparse_cfg["select"] >= 1.0:
+                    sparse_cfg = None
+
+            attn_dropout = self.attention_dropout if self.training else 0.0
+            use_sparse = sparse_cfg is not None and flex_attention_available() and not output_attentions
+
+            if not use_sparse:
+                attn_weights = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+                if ctx.attention_mask is not None:
+                    causal_mask = ctx.attention_mask[:, :, :, : k.shape[-2]]
+                    attn_weights = attn_weights + causal_mask
+
+                attn_weights = nn.functional.softmax(
+                    attn_weights, dim=-1, dtype=torch.float32
+                ).to(q.dtype)
+                attn_weights = nn.functional.dropout(
+                    attn_weights, p=attn_dropout, training=self.training
+                )
+                attn_output = torch.matmul(attn_weights, v)
+            else:
+                now_step = sparse_cfg["now_step"]
+                whole_steps = sparse_cfg["whole_steps"]
+                new_generation = sparse_cfg["new_generation"]
+                select = sparse_cfg["select"]
+                block_size = sparse_cfg["block_size"]
+
+                if now_step == 0:
+                    self.fine_mask = None
+                    self.last = None
+                    self.block_mask = None
+
+                end_time = int(whole_steps * sparse_cfg["skip"]) + 1
+                if now_step <= end_time:
+                    if now_step == end_time:
+                        query_states, key_states = q, k
+                        bsz2, num_heads, q_len, kv_len = (
+                            query_states.size(0),
+                            query_states.size(1),
+                            query_states.size(2),
+                            key_states.size(2),
+                        )
+                        if self.fine_mask is None:
+                            self.fine_mask = torch.zeros(
+                                (
+                                    bsz2,
+                                    num_heads,
+                                    (q_len + block_size - 1) // block_size,
+                                    (kv_len + block_size - 1) // block_size,
+                                ),
+                                dtype=torch.bool,
+                                device=query_states.device,
+                            )
+                            for idx in range((q_len + block_size - 1) // block_size):
+                                if (
+                                    q_len - idx * block_size <= new_generation
+                                    or idx == (q_len + block_size - 1) // block_size - 1
+                                ) and self.last is None:
+                                    self.last = idx
+                                query_states_reduce = query_states[:, :, idx * block_size : (idx + 1) * block_size]
+                                attn_weights = torch.matmul(
+                                    query_states_reduce, key_states.transpose(2, 3)
+                                ) / math.sqrt(self.head_dim)
+                                attn_weights = nn.functional.softmax(
+                                    attn_weights, dim=-1, dtype=torch.float32
+                                ).to(query_states.dtype)
+                                fine_mask = create_attention_block_mask(
+                                    attn_weights,
+                                    block_size=block_size,
+                                    keep_ratio=select,
+                                )
+                                self.fine_mask[:, :, idx : idx + 1, :] = fine_mask[:, :, :1, :]
+                            if self.last is not None:
+                                self.fine_mask[:, :, :, self.last :] = False
+
+                        if self.block_mask is None and self.last is not None and self.fine_mask is not None:
+                            key_states_reduce = key_states[:, :, self.last * block_size :, :]
+                            for idx in range((q_len + block_size - 1) // block_size):
+                                query_states_reduce = query_states[:, :, idx * block_size : (idx + 1) * block_size]
+                                attn_weights = torch.matmul(
+                                    query_states_reduce, key_states_reduce.transpose(2, 3)
+                                ) / math.sqrt(self.head_dim)
+                                attn_weights = nn.functional.softmax(
+                                    attn_weights, dim=-1, dtype=torch.float32
+                                ).to(query_states.dtype)
+                                fine_mask = create_attention_block_mask(
+                                    attn_weights,
+                                    block_size=block_size,
+                                    keep_ratio=select,
+                                )
+                                self.fine_mask[:, :, idx : idx + 1, self.last :] = torch.logical_or(
+                                    self.fine_mask[:, :, idx : idx + 1, self.last :],
+                                    fine_mask[:, :, :1, :],
+                                )
+                            new_mask = customize_mask(self.fine_mask, block_size=block_size)
+                            self.block_mask = create_block_mask_cached(
+                                new_mask,
+                                bsz2,
+                                num_heads,
+                                q_len,
+                                kv_len,
+                                device=query_states.device,
+                                _compile=True,
+                            )
+
+                    if self.flash_attn_func is not None and ctx.attention_mask is None:
+                        if not self._logged_attention_backend:
+                            _log_warning_once("Using flash_attn_func for Dream SparseD warmup.")
+                            self._logged_attention_backend = True
+                        attn_output = self.flash_attn_func(
+                            q.transpose(1, 2),
+                            k.transpose(1, 2),
+                            v.transpose(1, 2),
+                            dropout_p=attn_dropout,
+                            causal=False,
+                        ).transpose(1, 2).contiguous()
+                        attn_weights = None
+                    else:
+                        attn_weights = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+                        if ctx.attention_mask is not None:
+                            causal_mask = ctx.attention_mask[:, :, :, : k.shape[-2]]
+                            attn_weights = attn_weights + causal_mask
+                        attn_weights = nn.functional.softmax(
+                            attn_weights, dim=-1, dtype=torch.float32
+                        ).to(q.dtype)
+                        attn_weights = nn.functional.dropout(
+                            attn_weights, p=attn_dropout, training=self.training
+                        )
+                        attn_output = torch.matmul(attn_weights, v)
+                else:
+                    if ctx.attention_mask is not None or self.block_mask is None:
+                        attn_weights = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+                        if ctx.attention_mask is not None:
+                            causal_mask = ctx.attention_mask[:, :, :, : k.shape[-2]]
+                            attn_weights = attn_weights + causal_mask
+                        attn_weights = nn.functional.softmax(
+                            attn_weights, dim=-1, dtype=torch.float32
+                        ).to(q.dtype)
+                        attn_weights = nn.functional.dropout(
+                            attn_weights, p=attn_dropout, training=self.training
+                        )
+                        attn_output = torch.matmul(attn_weights, v)
+                    else:
+                        if not self._logged_attention_backend:
+                            _log_warning_once("Using flex_attention for Dream SparseD attention.")
+                            self._logged_attention_backend = True
+                        attn_output = flex_attention(q, k, v, block_mask=self.block_mask)
+                        attn_weights = None
+
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, -1, self.hidden_size)
+
+            o = self.o_proj(attn_output)
+            ctx.o = o
+            ctx.attn_weight = attn_weights
+
+        if not output_attentions:
+            attn_weights = None
+
+        return ctx.o, attn_weights, ctx.residual
+
+
+class DreamSdpaAttention(DreamAttention):
+    """
+    Dream attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+    `DreamAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    SDPA API.
+    """
+
+    # Adapted from DreamAttention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_norm: nn.Module,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[dCache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # will become mandatory in v4.46
+        SparseD_param: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        if SparseD_param is not None:
+            return super().forward(
+                hidden_states=hidden_states,
+                attn_norm=attn_norm,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                SparseD_param=SparseD_param,
+            )
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "DreamModel is using DreamSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attn_norm=attn_norm,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                SparseD_param=SparseD_param,
+            )
+
+        bsz, _, _ = hidden_states.size()
+        # create a dummy cache to simplify code
+        past_key_values = past_key_values or dCache(self.config)
+
+        with past_key_values.attention(
+            self.layer_idx,
+            hidden_states,
+            attn_norm,
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        ) as ctx:
+            q_mismatch = ctx.q.shape != hidden_states.shape and (
+                ctx.q_position_ids is None
+                or ctx.q_position_ids.shape != ctx.q.shape[:2]
+            )
+            kv_mismatch = (
+                ctx.k.shape != hidden_states.shape or ctx.v.shape != hidden_states.shape
+            ) and (
+                ctx.kv_position_ids is None
+                or ctx.kv_position_ids.shape != ctx.k.shape[:2]
+            )
+            if q_mismatch or kv_mismatch:
+                raise ValueError(
+                    "If you select a subset of the qkv in past_key_values, "
+                    "the q, k, v must match the shape of corresponding position_ids."
+                )
+
+            q = ctx.q.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            k = ctx.k.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
+            v = ctx.v.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(
+                1, 2
+            )
+
+            cos, sin = self.rotary_emb(v, ctx.kv_position_ids)
+            k = (k * cos.unsqueeze(1)) + (rotate_half(k) * sin.unsqueeze(1))
+            cos, sin = self.rotary_emb(q, ctx.q_position_ids)
+            q = (q * cos.unsqueeze(1)) + (rotate_half(q) * sin.unsqueeze(1))
+
+            # repeat k/v heads if n_kv_heads < n_heads
+            k = repeat_kv(k, self.num_key_value_groups)
+            v = repeat_kv(v, self.num_key_value_groups)
+
+            # causal_mask = attention_mask
+            # if attention_mask is not None:  # no matter the length, we just slice it
+            #     causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+            if self.flash_attn_func is not None and ctx.attention_mask is None:
+                if not self._logged_attention_backend:
+                    _log_warning_once("Using flash_attn_func for Dream attention.")
+                    self._logged_attention_backend = True
+                attn_output = self.flash_attn_func(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    causal=False,
+                )
+                attn_output = attn_output.transpose(1, 2).contiguous()
+            else:
+                # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+                # Reference: https://github.com/pytorch/pytorch/issues/112577.
+                if q.device.type == "cuda" and attention_mask is not None:
+                    q = q.contiguous()
+                    k = k.contiguous()
+                    v = v.contiguous()
+
+                if not self._logged_attention_backend:
+                    _log_warning_once("Using torch SDPA for Dream attention.")
+                    self._logged_attention_backend = True
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=(
+                        ctx.attention_mask
+                        if isinstance(ctx.attention_mask, torch.Tensor)
+                        else None
+                    ),
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    is_causal=False,  # hard coded
+                )
+
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.view(bsz, -1, self.hidden_size)
+
+            o = self.o_proj(attn_output)
+            ctx.o = o
+            ctx.attn_weight = None  # SDPA does not return attention weights
+
+        return ctx.o, None, ctx.residual
+
+
+DREAM_ATTENTION_CLASSES = {
+    "sdpa": DreamSdpaAttention,
+    "eager": DreamAttention,
+}
+
+
+class DreamDecoderLayer(nn.Module):
+    def __init__(self, config: DreamConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
+        if config.sliding_window and config._attn_implementation != "flash_attention_2":
+            logger.warning_once(
+                f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
+                "unexpected results may be encountered."
+            )
+
+        self.self_attn = DREAM_ATTENTION_CLASSES[config._attn_implementation](
+            config, layer_idx
+        )
+
+        self.mlp = DreamMLP(config)
+        self.input_layernorm = DreamRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = DreamRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[dCache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # will become mandatory in v4.46
+        SparseD_param: Optional[dict] = None,
+        **kwargs,
+    ):
+        """
+        Args:
+            hidden_states (`torch.Tensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.Tensor`, *optional*): attention mask of size
+                `(batch, sequence_length)` where padding elements are indicated by 0.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            use_cache (`bool`, *optional*):
+                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
+                (see `past_key_values`).
+            past_key_values (`dCache`, *optional*): cached past key and value projection states
+            cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+                Indices depicting the position of the input sequence tokens in the sequence.
+            position_embeddings (`Tuple[torch.Tensor, torch.Tensor]`, *optional*):
+                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
+                with `head_dim` being the embedding dimension of each attention head.
+            kwargs (`dict`, *optional*):
+                Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
+                into the model
+        """
+        # create a dummy cache to simplify code
+        past_key_values = past_key_values or dCache(self.config)
+
+        # Self Attention
+        hidden_states, self_attn_weights, residual = self.self_attn(
+            hidden_states=hidden_states,
+            attn_norm=self.input_layernorm,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            SparseD_param=SparseD_param,
+        )
+
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        with past_key_values.ffn(self.layer_idx, hidden_states) as ctx:
+            hidden_states = self.post_attention_layernorm(ctx.x)
+            hidden_states = self.mlp(hidden_states)
+            ctx.ffn_out = hidden_states
+
+        hidden_states = ctx.residual + ctx.ffn_out
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (past_key_values,)
+
+        return outputs
+
+
+class DreamPreTrainedModel(PreTrainedModel):
+    config_class = DreamConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["DreamDecoderLayer"]
+    _skip_keys_device_placement = "past_key_values"
+    _supports_flash_attn_2 = True
+    _supports_sdpa = True
+    _supports_cache_class = True
+    _supports_quantized_cache = True
+    _supports_static_cache = True
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
+        *model_args,
+        config: Optional[Union[PretrainedConfig, str, os.PathLike]] = None,
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        ignore_mismatched_sizes: bool = False,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[Union[str, bool]] = None,
+        revision: str = "main",
+        use_safetensors: Optional[bool] = None,
+        weights_only: bool = True,
+        **kwargs,
+    ):
+        _model = super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            config=config,
+            cache_dir=cache_dir,
+            ignore_mismatched_sizes=ignore_mismatched_sizes,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            use_safetensors=use_safetensors,
+            weights_only=weights_only,
+            **kwargs,
+        )
+        # NOTE(Lin): we need to override the generation config
+        # because the generation config loaded in `from_pretrained`
+        # does not include all the attributes of DreamGenerationConfig
+        resume_download = kwargs.get("resume_download", None)
+        proxies = kwargs.get("proxies", None)
+        subfolder = kwargs.get("subfolder", "")
+        from_auto_class = kwargs.get("_from_auto", False)
+        from_pipeline = kwargs.get("_from_pipeline", None)
+        _model.generation_config = DreamGenerationConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            subfolder=subfolder,
+            _from_auto=from_auto_class,
+            _from_pipeline=from_pipeline,
+        )
+        return _model
+
+
+class DreamBaseModel(DreamPreTrainedModel):
+    """
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`DreamDecoderLayer`]
+
+    Args:
+        config: DreamConfig
+    """
+
+    def __init__(self, config: DreamConfig):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
+        self.layers = nn.ModuleList(
+            [
+                DreamDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self._attn_implementation = config._attn_implementation
+        self.norm = DreamRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = DreamRotaryEmbedding(config=config)
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_values: Optional[dCache] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        SparseD_param: Optional[dict] = None,
+    ) -> Union[Tuple, BaseModelOutput]:
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        # create a dummy cache to simplify code
+        past_key_values = past_key_values or dCache(self.config)
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
+
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        assert inputs_embeds is not None  # for mypy type checking
+        if position_ids is None:
+            position_ids = (
+                torch.arange(
+                    inputs_embeds.shape[1],
+                    device=inputs_embeds.device,
+                )
+                .unsqueeze(0)
+                .expand(inputs_embeds.shape[0], -1)
+            )
+
+        cm = past_key_values.model_forward(inputs_embeds)
+        ctx = cm.__enter__()
+        hidden_states = ctx.x
+
+        # create position embeddings to be shared across the decoder layers
+        # position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = None
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)  # type: ignore
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                    SparseD_param,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    SparseD_param=SparseD_param,
+                )
+
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)  # type: ignore
+
+        hidden_states = self.norm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)  # type: ignore
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [hidden_states, all_hidden_states, all_self_attns]
+                + ([cm, ctx] if use_cache else [])
+                if v is not None
+            )
+        output = BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+        if use_cache:
+            output.cm = cm
+            output.ctx = ctx
+        return output
+
+
+class DreamModel(DreamGenerationMixin, DreamPreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = DreamBaseModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def reset_rope_parameters(self):
+        self.model.rotary_emb.reset_parameters()
+        for layer in self.model.layers:
+            layer.self_attn.rotary_emb.reset_parameters()  # type: ignore
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[dCache] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        num_logits_to_keep: int = 0,
+        SparseD_param: Optional[dict] = None,
+        **loss_kwargs,
+    ) -> Union[Tuple, MaskedLMOutput]:
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,  # hard coded
+            cache_position=cache_position,
+            SparseD_param=SparseD_param,
+        )
+
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+        if use_cache:
+            outputs.ctx.logits = logits
+            outputs.cm.__exit__(None, None, None)
+            logits = outputs.ctx.logits
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return MaskedLMOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )

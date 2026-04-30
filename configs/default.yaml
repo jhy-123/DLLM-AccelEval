@@ -1,0 +1,17 @@
+defaults:
+    - model: llada-base
+    - generation: vanilla
+    - cache: null
+    - _self_
+
+seed: 42
+batch_size: ${dataset.batch_size}
+attn_implementation: "sdpa" # sdpa or eager
+flash_attention: true
+dataset:
+    name: null # make sure the name is in lm-eval task list
+    size: null
+    per_task_results: false
+    n_shot: null # null means using default few-shot setting from lm-eval
+    system_prompt: null
+    batch_size: 1 # for speed testing, always 1

@@ -1,0 +1,8 @@
+strategy: "fast_dllm_v2"
+gen_length: 2048
+steps: 2048
+threshold: null
+block_length: null
+use_block_cache: False
+bd_size: null  # backward-compatible alias; defaults to generation.block_length when omitted
+small_block_size: null

@@ -1,0 +1,20 @@
+# extra generation configs will be loaded from the model config during runtime
+strategy: dpad
+
+alg: "maskgit_plus"
+gen_length: null
+block_length: null
+steps: null
+temperature: 0.0
+
+# DPad specific
+remasking: "low_confidence" # or "random"
+threshold: null
+dropout: "gaussian" # "gaussian", "uniform", or "null"
+sigma: null
+scale: null
+preserved_tokens: 0
+window: null
+early_termination: true
+
+output_probs: false

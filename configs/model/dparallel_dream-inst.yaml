@@ -1,0 +1,6 @@
+defaults:
+  - dream-common
+  - _self_
+
+name: dparallel_dream-inst
+path: ${oc.env:DPARALLEL_DREAM_INST_PATH}

@@ -1,0 +1,14 @@
+family: ar
+dtype: bfloat16
+trust_remote_code: true
+use_fast: true
+low_cpu_mem_usage: true
+device_map: null
+padding_side: left
+
+generation:
+  mask_token_id: null
+  eos_token_id: null
+  pad_token_id: null
+  stop_until_eos: true
+  gen_length: 2048

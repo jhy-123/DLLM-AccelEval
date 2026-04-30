@@ -1,0 +1,33 @@
+# extra generation configs will be loaded from the model config during runtime
+strategy: vanilla
+
+# parallel decoding proposed in https://arxiv.org/abs/2505.22618, only one of these two can be specified
+threshold: null # all tokens whose confidence is above this threshold will be fixed
+factor: null # factor-based parallel decoding factor
+
+# Enable the sparsed path implemented in src/generation/sparsed_vanilla.py
+# SparseD only supports generation-only decoding and cannot be combined with cache=prefix/dkvcache.
+# Example:
+#   generation.sparsed=true generation.sparsed_select=0.3 generation.sparsed_skip=0.1 generation.sparsed_block_size=128
+sparsed: false
+sparsed_select: 0.5
+sparsed_skip: 0.2
+sparsed_block_size: 32
+
+alg: "maskgit_plus"
+gen_length: null
+block_length: null
+steps: null
+temperature: 0.0
+top_p: null
+top_k: null
+
+# The standard deviation of the Gaussian kernel used in decoding with certainty prior, see https://arxiv.org/abs/2509.23094.
+sigma: null
+
+# whether to stop generation when meets the EOS token
+stop_until_eot: false
+
+output_probs: false
+
+cache_reloading_step: null

@@ -1,0 +1,16 @@
+# extra generation configs will be loaded from the model config during runtime
+strategy: sparse
+
+alg: "maskgit_plus"
+gen_length: null
+block_length: null
+steps: null
+temperature: 0.0
+
+# Sparse-dLLM specific
+remasking: "low_confidence" # or "random"
+keep_ratio: 0.5
+kernel_size: 3
+early_termination: true
+
+output_probs: false

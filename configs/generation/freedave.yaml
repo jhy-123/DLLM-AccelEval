@@ -1,0 +1,9 @@
+defaults:
+  - vanilla
+  - _self_
+
+strategy: "freedave"
+
+# Policy-only FreeDave variant.
+draft_steps: 4
+confidence_threshold: null

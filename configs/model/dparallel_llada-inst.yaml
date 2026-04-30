@@ -1,0 +1,6 @@
+defaults:
+  - llada-common
+  - _self_
+
+name: dparallel_llada-inst
+path: ${oc.env:DPARALLEL_LLADA_INST_PATH}

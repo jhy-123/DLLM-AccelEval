@@ -1,0 +1,7 @@
+defaults:
+  - dream-common
+  - _self_
+
+name: d2f_dream-inst
+lora_path: ${oc.env:D2F_DREAM_INST_PATH}
+path: ${oc.env:DREAM_INST_PATH}

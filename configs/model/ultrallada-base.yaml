@@ -1,0 +1,7 @@
+defaults:
+  - llada-common
+  - _self_
+
+name: ultrallada-base
+path: ${oc.env:ULTRALLADA_BASE_PATH}
+apply_chat_template: false

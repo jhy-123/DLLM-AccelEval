@@ -1,0 +1,6 @@
+defaults:
+  - ar-common
+  - _self_
+
+name: qwen2.5-7b-instruct
+path: ${oc.env:QWEN25_7B_INST_PATH}

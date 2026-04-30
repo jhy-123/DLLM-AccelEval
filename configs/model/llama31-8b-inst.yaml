@@ -1,0 +1,6 @@
+defaults:
+  - ar-common
+  - _self_
+
+name: llama3.1-8b-instruct
+path: ${oc.env:LLAMA31_8B_INST_PATH}

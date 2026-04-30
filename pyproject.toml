@@ -1,0 +1,6 @@
+[build-system]
+requires = [ "setuptools>=70.0", "wheel",]
+build-backend = "setuptools.build_meta"
+
+[tool.pyright]
+exclude = [ "src/models/llada", "src/models/dream", "src/models/fast_dllm_v2", "tasks/"]

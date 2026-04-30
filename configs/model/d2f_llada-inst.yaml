@@ -1,0 +1,7 @@
+defaults:
+  - llada-common
+  - _self_
+
+name: d2f_llada-inst
+lora_path: ${oc.env:D2F_LLADA_INST_PATH}
+path: ${oc.env:LLADA_INST_PATH}

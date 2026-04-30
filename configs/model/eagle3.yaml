@@ -1,0 +1,23 @@
+defaults:
+  - _self_
+
+family: eagle3
+name: eagle3
+base_model_path: null
+ea_model_path: null
+dtype: bfloat16
+device_map: null
+apply_chat_template: true
+padding_side: left
+use_fast: false
+max_length: 32768
+total_token: 60
+depth: 5
+top_k: 10
+draft_sliding_window: 2048
+
+generation:
+  mask_token_id: 0
+  eos_token_id: 2
+  pad_token_id: 2
+  stop_until_eos: true

@@ -1,0 +1,30 @@
+tag:
+  - longbench
+task: longbench_gov_report
+dataset_path: THUDM/LongBench
+dataset_kwargs:
+  trust_remote_code: true
+test_split: test
+dataset_name: gov_report
+doc_to_text: 'You are given a report by a government agency. Write a one-page summary of the report.
+
+Report:
+{{context}}
+
+Now, write a one-page summary of the report.
+
+Summary:'
+doc_to_target: '{{answers}}'
+process_results: !function metrics.get_rouge_score
+generation_kwargs:
+  max_gen_toks: 512
+  temperature: 0
+  do_sample: False
+  until: []
+metric_list:
+  - metric: "rouge_score"
+    aggregation: mean
+    higher_is_better: True
+metadata:
+  version: 3.0
+  apply_chat_template: true
